@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sink-tg-bot",
+  "main": "index.js",
+  "compatibility_date": "2025-05-08",
+  "services": [
+    {
+      "binding": "SINK",
+      "service": "sink"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "BOT_STATE",
+      "id": "6091ec37a3464dd1a1ab72f4000bb214"
+    }
+  ]
+}
