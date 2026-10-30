@@ -151,8 +151,52 @@ function fetchSink(env, url, options) {
   return fetch(url, options);
 }
 
+// Current Sink returns { link: { slug, url }, shortLink }. Older builds returned the link itself.
+function createdSlug(data) {
+  if (!data || typeof data !== 'object') return '';
+  if (data.link && typeof data.link.slug === 'string') return data.link.slug;
+  if (typeof data.slug === 'string') return data.slug;
+  return '';
+}
+
+function createdShortUrl(env, data) {
+  const slug = createdSlug(data);
+  const fromApi = data && typeof data.shortLink === 'string' ? data.shortLink.trim() : '';
+  if (fromApi && slug && fromApi.endsWith('/' + slug)) return fromApi;
+  const origin = String(env.SINK_API_URL || '').replace(/\/+$/, '');
+  return slug && origin ? origin + '/' + slug : '';
+}
+
+function createSuccessText(env, data) {
+  const slug = createdSlug(data);
+  const shortUrl = createdShortUrl(env, data);
+  if (!slug || !shortUrl) {
+    const raw = JSON.stringify(data || {}).slice(0, 120).replace(/`/g, "'");
+    return '❌ 接口返回成功，但没有短链接别名。\n`' + raw + '`';
+  }
+  return '✨ *生成成功！*\n\n🔗 缩短后链接：' + shortUrl + '\nℹ️ 查看详情：\n`/info ' + slug + '`';
+}
+
+function linkCreateBody(fields) {
+  const body = { url: fields.url };
+  if (fields.slug) body.slug = fields.slug;
+  if (fields.comment) body.comment = fields.comment;
+  if (fields.password) body.password = fields.password;
+  if (typeof fields.cloaking === 'boolean') body.cloaking = fields.cloaking;
+  return body;
+}
+
+async function readJsonBody(response) {
+  const text = await response.text();
+  try {
+    return { json: JSON.parse(text), text };
+  } catch {
+    return { json: null, text };
+  }
+}
+
 // 1. Call Sink API to create short link
-async function createShortLink(longUrl, slug, env) {
+async function createShortLink(longUrl, slug, env, extra = {}) {
   try {
     const response = await fetchSink(env, `${env.SINK_API_URL}/api/link/create`, {
       method: 'POST',
@@ -160,17 +204,16 @@ async function createShortLink(longUrl, slug, env) {
         'Authorization': `Bearer ${env.SINK_SITE_TOKEN}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ url: longUrl, slug: slug })
+      body: JSON.stringify(linkCreateBody({ url: longUrl, slug, ...extra }))
     });
+    const parsed = await readJsonBody(response);
 
-    if (response.status === 201) {
-      const data = await response.json();
-      const shortUrl = `${env.SINK_API_URL}/${data.slug}`;
-      return `✨ *生成成功！*\n\n🔗 缩短后链接：${shortUrl}\nℹ️ 查看详情：\n\`/info ${data.slug}\``;
+    if (response.status === 201 || (response.ok && createdSlug(parsed.json))) {
+      return createSuccessText(env, parsed.json);
     } else if (response.status === 409) {
-      return `❌ 创建失败：自定义别名 \`${slug}\` 已存在，请换一个重试。`;
+      return `❌ 创建失败：自定义别名 \`${slug || ''}\` 已存在，请换一个重试。`;
     } else {
-      const errorText = await response.text();
+      const errorText = (parsed.text || '').replace(/`/g, "'");
       return `❌ 接口请求失败：${response.status}\n\`${errorText.slice(0, 100)}\``;
     }
   } catch (e) {
@@ -458,31 +501,15 @@ async function handleWizardStep(chatId, text, state, stateKey, env) {
           await sendToTelegram(chatId, '🚀 正在请求短链接系统生成链接...', env.TG_TOKEN);
           
           try {
-            const response = await fetchSink(env, `${env.SINK_API_URL}/api/link/create`, {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${env.SINK_SITE_TOKEN}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                url: state.url,
-                slug: state.slug,
-                comment: state.comment,
-                password: state.password,
-                cloaking: state.cloaking
-              })
+            const result = await createShortLink(state.url, state.slug, env, {
+              comment: state.comment,
+              password: state.password,
+              cloaking: state.cloaking
             });
-
-            if (response.status === 201) {
-              const data = await response.json();
-              const shortUrl = `${env.SINK_API_URL}/${data.slug}`;
-              await sendToTelegram(chatId, `✨ *生成成功！*\n\n🔗 短网址：${shortUrl}\nℹ️ 查看详情：\n\`/info ${data.slug}\``, env.TG_TOKEN);
-            } else if (response.status === 409) {
-              await sendToTelegram(chatId, `❌ 创建失败：自定义别名 \`${state.slug}\` 已存在，请发送 \`/add\` 重新开始创建。`, env.TG_TOKEN);
-            } else {
-              const errorText = await response.text();
-              await sendToTelegram(chatId, `❌ 接口请求失败：${response.status}\n\`${errorText.slice(0, 100)}\``, env.TG_TOKEN);
-            }
+            const textOut = result.includes('已存在')
+              ? `❌ 创建失败：自定义别名 \`${state.slug || ''}\` 已存在，请发送 \`/add\` 重新开始创建。`
+              : result;
+            await sendToTelegram(chatId, textOut, env.TG_TOKEN);
           } catch (e) {
             await sendToTelegram(chatId, `❌ 无法连接到 Sink 短链接服务：${e.message}`, env.TG_TOKEN);
           } finally {
@@ -641,13 +668,24 @@ async function handleWizardStep(chatId, text, state, stateKey, env) {
 // Send message to Telegram
 async function sendToTelegram(chatId, text, token) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  await fetch(url, {
+  const sent = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       chat_id: chatId,
       text: text,
       parse_mode: 'Markdown',
+      disable_web_page_preview: true
+    })
+  });
+  if (sent.ok) return;
+  // A "_" in a URL, or an API error body, breaks legacy Markdown and drops the reply.
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: String(text).replace(/[*_`\[\]]/g, ''),
       disable_web_page_preview: true
     })
   });
